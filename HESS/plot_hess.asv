@@ -1,0 +1,62 @@
+function plot_hess(time, Pel, Pfc, mass_H2, mdot_el, mdot_fc, Pcomp, Ptank, doComp)
+%PLOT_HESS  Plot HESS results.
+%
+% Inputs:
+%  time    - [1×N] hours
+%  Pel     - [1×N] electrolyzer power (kW)
+%  Pfc     - [1×N] fuel-cell power (kW)
+%  mass_H2 - [1×N] H2 in tank (kg)
+%  mdot_el - [1×N] H2 production (kg/h)
+%  mdot_fc - [1×N] H2 consumption (kg/h)
+%  Pcomp   - [1×N] compressor power (kW)
+%  Ptank   - [1×N] tank pressure (bar)
+%  doComp  - logical: plot compressor axes
+
+  figure('Units','normalized','Position',[.1 .1 .8 .8]);
+
+  %--- 1) Power Profile ---  
+  subplot( doComp+3, 1, 1 );
+    plot(time, Pel,'-b', time, Pfc,'-r','LineWidth',1.2);
+    title('Power Profile'); ylabel('Power [kW]');
+    legend('P_{el}','P_{fc}','Location','best'); grid on;
+    xticks(0:10:time(end));
+
+  %--- 2) H2 Tank Level ---
+  subplot( doComp+3,1,2 );
+    plot(time, mass_H2,'-k','LineWidth',1.2);
+    title('H_2 Tank Level'); ylabel('Mass [kg]'); grid on;
+    ylim([0 p.max_mass_H2]); yticks(0:50:p.max_mass_H2);
+    xticks(0:10:time(end));
+
+  %--- 3) H2 Flow Rates ---
+  subplot( doComp+3,1,3 );
+    plot(time, mdot_el,'-g', time, mdot_fc,'-m','LineWidth',1.2);
+    title('Hydrogen Flow Rates'); xlabel('Time [hr]');
+    ylabel('Mass Flow [kg/hr]');
+    legend('Production','Consumption','Location','best'); grid on;
+    xticks(0:10:time(end));
+
+  %--- 4) Compressor & Tank (optional) ---
+  if doComp
+    subplot(4,1,4);
+      yyaxis left
+        plot(time, Pcomp, '-m','LineWidth',1.2);
+        ylabel('Compressor P [kW]');
+      yyaxis right
+        plot(time, Ptank, '--g','LineWidth',1.2);
+        ylabel('Tank Pressure [bar]');
+      xlabel('Time [hr]');
+      title('Compressor & Tank Pressure');
+      legend('P_{comp}','P_{tank}','Location','best');
+      grid on;
+      xticks(0:10:time(end));
+  end
+
+  %--- Display hourly log table to console & CSV ---
+  T = table( time(:), mdot_el(:), mdot_fc(:), mass_H2(:), ...
+             'VariableNames',{'Hour','H2_prod_kgph','H2_cons_kgph','Tank_mass_kg'} );
+  disp(T);
+
+  [p,n,~] = fileparts(mfilename('fullpath'));
+  writetable(T, fullfile(p,[n '_hourly_log.csv']));
+end

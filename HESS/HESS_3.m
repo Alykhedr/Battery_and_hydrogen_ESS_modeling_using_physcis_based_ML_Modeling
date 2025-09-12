@@ -1,172 +1,198 @@
-%  3rd level HESS Model 3
-% Author: Aly Khedr 
-% Description: 
-
+% HESS_3.m  
+% Level 3 HESS Model (Electrochemical + Compressor-first allocation)
 clear; clc; close all;
 
-%% ------------------ Input Parameters ------------------
-dt = 1;                      % Time step [hr]
-T = 48;                     % Total simulation time [hr]
-time = 0:dt:T;
+%% 0) choose level
+modelLevel = 3;            % <-- set to 2 or 1 to downgrade features
 
-% Universal Constants
-F = 96485;                  % Faraday constant [C/mol]
-R = 8.314;                  % Gas constant [J/mol/K]
-T_el = 350;                 % Electrolyzer temperature [K]
-T_tank = 300;               % Tank temperature [K]
-LHV_H2 = 33.33;             % Lower heating value [kWh/kg]
-M_H2 = 0.002016;            % Hydrogen molar mass [kg/mol]
+%% 1) load profiles
+[time, P_el, P_fc] = load_profiles();
 
-% Electrolyzer Parameters
-V_el_r = 1.23;              % Reversible voltage [V]
-Omega_el = 0.2;             % Ohmic resistance [Ohm·cm^2]
-sigma_p = 0.5; sigma_n = 0.5;
-ip = 1e-4; in_ = 1e-3;       % Exchange current densities [A/cm^2]
-A_el = 1000;                % Active area [cm^2]
-N_el = 400;                 % Number of cells
-L = 0.0178;                 % Membrane thickness [cm]
+%% 2) constants & flags (drive enables from modelLevel)
+p = params(time, modelLevel);  % sets p.enable.compressor / p.enable.electrochem
 
-% Permeability
-epsilon_H2f = 2e-10;
-epsilon_O2f = 1e-10;
-epsilon_H2p = 1e-10;
-xi_H2 = 0.01; xi_O2 = 0.01;
-P_H2 = 5; P_O2 = 5;          % [bar]
+%% 3) timestep
+dt = time(2) - time(1);
+N  = numel(time);
 
-% Fuel Cell Parameters
-eta_FC = 0.60;
+%% 4) pre-allocate variables (names unchanged)
+n_H2        = zeros(1,N);
+P_tank      = zeros(1,N);
+P_comp      = zeros(1,N);
+eta_el      = zeros(1,N);
+P_tank_bar  = zeros(1,N);
 
-% Compressor Parameters
-Cp_H2 = 14.3; eta_C = 0.75; T_C = 300; gamma = 1.4;
-P_inlet = 10e5; P_outlet = 70e5;
+% Always allocate these so export/plots don't crash; fill only when used
+i_sol       = zeros(1,N);
+V_cell      = zeros(1,N);
+eta_F       = zeros(1,N);
 
-% Tank Parameters
-V_tank = 12;                % [m^3]
-
-%% ------------------ Initialization ------------------
-n_H2 = zeros(1, length(time));
-P_el = zeros(1, length(time));
-P_fc = zeros(1, length(time));
-m_dot_el = zeros(1, length(time));
-m_dot_fc = zeros(1, length(time));
-P_tank = zeros(1, length(time));
-P_C = zeros(1, length(time));
-i_sol = zeros(1, length(time));
-V_cell = zeros(1, length(time));
-eta_tf = zeros(1, length(time));
-
-n_H2(1) = 25 / M_H2;  % initial H2 [mol]
-
-%% ------------------ Power Profile ------------------
-max_power = 400;
-rng(1);
-for t = 2:length(time)
-    if rand < 0.5
-        P_el(t) = rand * max_power;
-    else
-        P_fc(t) = rand * max_power;
-    end
+% time-invariant area only needed if electrochem is on
+if p.enable.electrochem
+  area_cm2 = p.el.A * 1e4;
 end
 
-%% ------------------ Simulation Loop ------------------
-fprintf('%5s %10s %10s %15s %15s %15s\n', 'Time', 'P_el', 'P_fc', 'H2 Mass [kg]', 'P_C [kW]', 'P_tank [bar]');
+m_dot_el    = p.init.m_dot_el;
+m_dot_fc    = p.init.m_dot_fc;
+mass_H2     = zeros(1,N);
+m_H2_prev   = zeros(1,N);
 
-for t = 2:length(time)
-    Pel_t = P_el(t);
-    Pfc_t = P_fc(t);
+%% Debug header
+fprintf(' hr | Pavail | P_comp_id | P_comp_act | P_remain | P_el_act | P_tank_bar\n');
 
-    %% Electrolyzer
-    if Pel_t > 0
-        % Solve for current density using fzero
-        fun = @(i) N_el * i * A_el / 1000 * ...
-            (V_el_r + (R*T_el/(2*F))*log(P_H2*sqrt(P_O2)) + Omega_el*i + ...
-            (R*T_el)/(sigma_p*F)*asinh(i/(2*ip)) + (R*T_el)/(sigma_n*F)*asinh(i/(2*in_))) - Pel_t;
-        i_guess = fzero(fun, [0.01 2]);
-        i_sol(t) = i_guess;
+%% 5) initial tank values (ideal gas here)
+n_H2(1)        = p.init.mass_H2(1)/p.M_H2;
+mass_H2(1)     = p.init.mass_H2(1);
+P_tank(1)      = n_H2(1)*p.R*p.tank.T/p.tank.V;
+P_tank_bar(1)  = P_tank(1)/1e5;
+P_inlet_bar = p.P_inlet / 1e5;  
 
-        % Voltage
-        V_cell(t) = V_el_r + (R*T_el/(2*F))*log(P_H2*sqrt(P_O2)) + Omega_el*i_guess + ...
-                    (R*T_el)/(sigma_p*F)*asinh(i_guess/(2*ip)) + ...
-                    (R*T_el)/(sigma_n*F)*asinh(i_guess/(2*in_));
 
-        % Pressures
-        pi_H2n = P_H2 + xi_H2 * (1 + epsilon_H2p / epsilon_H2f) * i_guess;
-        pi_O2p = P_O2 + xi_O2 * i_guess;
+%% 6) simulation loop
+for k = 2:N
+  % a) fuel-cell consumption (cap by available tank mass like Model-2/3)
+  if P_fc(k) > 0
+    m_fc_req    = P_fc(k)/(p.eta_fc*p.LHV_H2);   % kg/h
+    m_fc_cap    = max(0, mass_H2(k-1)/dt);       % kg/h available this step
+    m_dot_fc(k) = min(m_fc_req, m_fc_cap);
+  else
+    m_dot_fc(k) = 0;
+  end
+  m_H2_prev(k) = mass_H2(k-1);
 
-        % Faraday Efficiency
-        eta = 1 - (2 * F * epsilon_H2f * pi_H2n * L + ...
-                  4 * F * epsilon_O2f * pi_O2p * L + ...
-                  2 * F * epsilon_H2p * pi_H2n * pi_O2p * L);
-        eta_tf(t) = max(min(eta, 1), 0);
+  % b) tank update (mass balance using last step’s actual flows)
+  n_H2(k)    = n_H2(k-1) + (m_dot_el(k-1) - m_dot_fc(k-1))*dt/p.M_H2;
+  n_H2(k)    = min(max(n_H2(k),0), p.max_mass_H2/p.M_H2);
+  mass_H2(k) = n_H2(k)*p.M_H2;
 
-        % Hydrogen Production
-        m_dot_el(t) = N_el * eta_tf(t) * i_guess * A_el / (2*F) * M_H2 * 3600;
-    end
+  % pressure (ideal gas; your Z work can be re-inserted later if desired)
+  P_tank(k)     = n_H2(k)*p.R*p.tank.T/p.tank.V;
+  P_tank_bar(k) = P_tank(k)/1e5;
 
-    %% Fuel Cell
-    if Pfc_t > 0
-        required_mass = Pfc_t / (eta_FC * LHV_H2);
-        available_mass = n_H2(t-1) * M_H2;
-        m_dot_fc(t) = min(required_mass, available_mass / dt);
-    end
+  % c) available PV
+  P_available = max(0, P_el(k));  % kW
 
-    %% Tank State
-    n_dot_el = m_dot_el(t) / M_H2;
-    n_dot_fc = m_dot_fc(t) / M_H2;
-    n_H2(t) = n_H2(t-1) + (n_dot_el - n_dot_fc) * dt;
-    n_H2(t) = max(min(n_H2(t), 50 / M_H2), 0);
-    P_tank(t) = (n_H2(t) * R * T_tank) / V_tank;
+  % d) compressor-first allocation
+  P_comp_id  = 0; P_comp_act = 0; P_remain = P_available; PR = 0;
 
-    %---- 4) Compressor Work ----%
-   n_dot_el = m_dot_el(t) / M_H2 / 3600;  
+  if p.enable.compressor && P_available > 0
+    % --- Compressor logic depends on whether electrochemistry is active ---
+    if p.enable.electrochem
+      % (Model-3 path) size compressor for the "i_max" electrolyzer guess
+      V_design   = cell_voltage(p.el.i, p);
+      P_req      = p.el.N * p.el.i * area_cm2 * V_design / 1e3;      % kW
+      frac_max   = min(1, P_available / P_req);
+      i_max      = p.el.i * frac_max;
+      V_max      = cell_voltage(i_max, p);
+      I_tot_max  = p.el.N * i_max * area_cm2;
+      eta_fmax   = faraday_eff(i_max, p);
+      mol_s_max  = I_tot_max * eta_fmax / (2*p.F);                   % mol/s
 
-    if n_dot_el > 0 && P_tank(t) < P_outlet
-        PR = P_outlet / max(P_tank(t), P_inlet);
-        P_C(t) = n_dot_el * Cp_H2 * T_C / eta_C * (PR^((gamma-1)/gamma) - 1);
+      PR = max(P_tank_bar(k) / P_inlet_bar, 1.0 + 1e-9);   % dimensionless
+      W_comp     = mol_s_max * p.Cp_H2 * p.tank.T ...
+                   * (PR^((p.gamma-1)/p.gamma) - 1) / p.eta_C;       % W
+      P_comp_id  = W_comp / 1e3;                                     % kW
+      P_comp_act = min(P_comp_id, P_available);                       % kW
+      P_comp(k)  = P_comp_act * 1e3;                                  % W
+      P_remain   = P_available - P_comp_act;                          % kW
+
     else
-       P_C(t) = 0;
+      % (Model-2 behavior) fixed-η electrolyzer estimate for compressor sizing
+      mdot_raw   = p.eta_el * P_available / p.LHV_H2;                 % kg/h
+      mdot_mol   = mdot_raw / p.M_H2 / 3600;                          % mol/s
+      PR         = max(P_tank(k) / p.P_inlet, 1.0);
+      W_comp     = mdot_mol * p.Cp_H2 * p.tank.T ...
+                   * (PR^((p.gamma-1)/p.gamma) - 1) / p.eta_C;        % W
+      P_comp_id  = W_comp / 1e3;                                      % kW
+      P_comp_act = min(P_comp_id, P_available);                        % kW
+      P_comp(k)  = P_comp_act * 1e3;                                  % W
+      P_remain   = P_available - P_comp_act;                          % kW
+    end
+  else
+    % compressor disabled or no PV
+    P_comp(k) = 0;   % W
+  end
+
+  %% e) electrolyzer block
+  if p.enable.electrochem
+    % (Model-3) solve exact current for P_remain
+    V_design  = cell_voltage(p.el.i, p);
+    P_req     = p.el.N * p.el.i * area_cm2 * V_design / 1e3;   % kW
+
+    if P_remain > 0
+      if P_remain >= P_req
+        i_act = p.el.i;
+      else
+        fun  = @(i) p.el.N * i * area_cm2 .* cell_voltage(i,p) / 1e3 - P_remain;
+        i_act = fzero(fun, [0, p.el.i]);
+      end
+      V_act      = cell_voltage(i_act, p);
+      P_el_act   = p.el.N * i_act * area_cm2 * V_act / 1e3;           % kW
+      eta_F(k)   = faraday_eff(i_act, p);
+      mol_s      = p.el.N * i_act * area_cm2 * eta_F(k) / (2*p.F);    % mol/s
+      m_dot_el(k)= mol_s * p.M_H2 * 3600;                              % kg/h
+      eta_el(k)  = m_dot_el(k) * p.LHV_H2 / max(P_el_act, eps);
+      i_sol(k)   = i_act;
+      V_cell(k)  = V_act;
+    else
+      P_el_act   = 0;
+      m_dot_el(k)= 0;
     end
 
-    fprintf('%5d %10.2f %10.2f %15.4f %15.4f %15.2f\n', ...
-        time(t), Pel_t, Pfc_t, n_H2(t)*M_H2, P_C(t)/1000, P_tank(t)/1e5);
+  else
+    % (Model-1/2) fixed-η electrolyzer using the remainder
+    P_el_act    = P_remain;                                           % kW
+    m_dot_el(k) = p.eta_el * P_el_act / p.LHV_H2;                     % kg/h
+    eta_el(k)   = (P_el_act>0) * p.eta_el;                             % for plotting/export
+    % i_sol, V_cell, eta_F remain zero
+  end
+
+  % f) debug print
+  fprintf('%3d | %6.1f | %10.2f | %10.2f | %8.2f | %8.2f | %10.2f\n', ...
+          time(k), P_available, P_comp_id, P_comp_act, P_remain, P_el_act, P_tank_bar(k));
 end
 
-%% ------------------ Post-Processing ------------------
-mass_H2 = n_H2 * M_H2;
-P_C_kW = P_C / 1000;
-P_tank_bar = P_tank / 1e5;
+%% 7) plot overall electrolyzer efficiency vs current density (only if electrochem on)
+if p.enable.electrochem
+  figure
+  plot(i_sol, eta_el, '.-','LineWidth',1.5)
+  xlabel('Current density i (A/cm^2)')
+  ylabel('\eta_{el}')
+  title('Electrolyzer efficiency vs. current density')
+  grid on
+end
 
-%% ------------------ Visualization (Model 3, trimmed) ------------------
-figure('Position',[100 100 800 600]);
+%% 8) plot cell voltage, current & efficiency over time (only if electrochem on)
+if p.enable.electrochem
+  figure
+  subplot(3,1,1)
+  plot(time, V_cell, 'LineWidth',1.5)
+  ylabel('V_{cell} (V)')
+  title('Electrolyzer Cell Voltage')
+  grid on
 
-% 1) Power Profile
-subplot(2,2,1);
-plot(time, P_el, 'b', time, P_fc, 'r', 'LineWidth',1.2);
-title('Power Profile'); ylabel('kW'); xlabel('Time [hr]');
-legend('P_{el}','P_{fc}'); grid on;
+  subplot(3,1,2)
+  plot(time, i_sol, 'LineWidth',1.5)
+  ylabel('i (A/cm^2)')
+  title('Actual Current Density')
+  grid on
 
-% 2) H2 Mass in Tank
-subplot(2,2,2);
-plot(time, mass_H2, 'k', 'LineWidth',1.5);
-title('H₂ Mass in Tank'); ylabel('kg'); xlabel('Time [hr]');
-grid on;
+  subplot(3,1,3)
+  plot(time, eta_F, 'LineWidth',1.5)
+  ylabel('\eta_F')
+  xlabel('Time (h)')
+  title('Faraday Efficiency over Time')
+  grid on
+end
 
-% 3) Compressor Power & Tank Pressure
-subplot(2,2,3);
-yyaxis left
-plot(time, P_C_kW, 'm', 'LineWidth',1.5);
-ylabel('Compressor Power [kW]');
-yyaxis right
-plot(time, P_tank_bar, 'g--', 'LineWidth',1.5);
-ylabel('Tank Pressure [bar]');
-xlabel('Time [hr]');
-title('Compressor & Pressure');
-legend('P_C','P_{tank}','Location','best');
-grid on;
+%% 9) full system plot (always)
+P_comp_kW = P_comp/1e3;
+plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, P_comp_kW, P_tank_bar);
 
-% 4) Current Density
-subplot(2,2,4);
-plot(time, i_sol, 'b', 'LineWidth',1.2);
-title('Electrolyzer Current Density'); 
-ylabel('A/cm^2'); xlabel('Time [hr]');
-grid on;
+%% 10) export
+tbl = table(time(:), P_el(:), P_fc(:), m_H2_prev(:), m_dot_el(:), m_dot_fc(:), eta_el(:), ...
+            i_sol(:), V_cell(:), eta_F(:), P_comp_kW(:), mass_H2(:), P_tank_bar(:), ...
+            'VariableNames', {'Hour','P_el','P_fc','m_H2_prev','m_dot_el','m_dot_fc','eta_el', ...
+                              'i_sol','V_cell','eta_F','P_comp','m_H2','P_tank_bar'});
+writetable(tbl, 'model3_train_data.csv');
+fprintf('Exported %d rows\n', height(tbl));
