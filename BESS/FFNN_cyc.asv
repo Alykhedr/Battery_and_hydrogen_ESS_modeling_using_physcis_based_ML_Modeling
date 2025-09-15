@@ -1,0 +1,357 @@
+% cycle_build_and_train.m
+% Build an ML-ready long table from cycle Capacity–FEC .mat files and train a small FFNN.
+% Files included: Loadcollectives, xDOD_*, xCyC_*, xSOC_* with "Capacity_CC_CV_FEC".
+% Files excluded: *_R_DC_* and *_Time*.
+% Output artefacts:
+%   - cycle_longtable.csv
+%   - cycle_longtable.mat  (T_cyc)
+%   - cycle_train/val/test CSVs
+%   - cycle_splits.mat     (features, scalers, splits, trained net)
+
+clear; clc;
+
+%% ---------- SETTINGS ----------
+USE_PROFILE_DUMMIES = true;     % one-hot encode "profile_type"
+SCALE_METHOD        = 'standard'; % 'standard' | 'minmax' | 'none'
+RNG_SEED            = 42;
+
+out_csv_long  = 'cycle_longtable.csv';
+out_mat_long  = 'cycle_longtable.mat';
+
+train_csv     = 'cycle_train.csv';
+val_csv       = 'cycle_val.csv';
+test_csv      = 'cycle_test.csv';
+splits_mat    = 'cycle_splits.mat';
+
+%% ---------- STEP 0: COLLECT FILES ----------
+allMats = dir('*.mat');
+keep = false(numel(allMats),1);
+for i = 1:numel(allMats)
+    nm = allMats(i).name;
+    keep(i) = contains(nm,'Capacity_CC_CV_FEC','IgnoreCase',true) ...
+           && ~contains(nm,'_R_DC_','IgnoreCase',true) ...
+           && ~contains(nm,'_Time','IgnoreCase',true);
+end
+files = cellfun(@(p,n) fullfile(p,n), {allMats(keep).folder}, {allMats(keep).name}, 'uni', false);
+assert(~isempty(files), 'No Capacity_CC_CV_FEC .mat files found.');
+
+fprintf('Scanning %d Capacity–FEC file(s):\n', numel(files));
+for i = 1:numel(files), fprintf('  [%2d] %s\n', i, files{i}); end
+
+%% ---------- STEP 1: STRUCTURE (wide -> long, parse legend) ----------
+% pass 1: count total rows to preallocate
+totalRows = 0; protoCount = 0;
+for f = 1:numel(files)
+    S = load(files{f});
+    if ~isfield(S,'X_Axis_Data_Mat') || ~isfield(S,'Y_Axis_Data_Mat'), warning('Skip: %s', files{f}); continue; end
+    X = S.X_Axis_Data_Mat; Y = S.Y_Axis_Data_Mat;
+    if ~isequal(size(X),size(Y)), warning('X/Y size mismatch: %s', files{f}); continue; end
+    [~,N] = size(X);
+    for j = 1:N
+        m = ~isnan(X(:,j)) & ~isnan(Y(:,j));
+        c = nnz(m);
+        if c>0, totalRows = totalRows + c; protoCount = protoCount + 1; end
+    end
+end
+assert(totalRows>0, 'No finite (FEC, SOH) pairs found.');
+
+% preallocate
+proto_id     = strings(totalRows,1);
+legend_label = strings(totalRows,1);
+profile_type = strings(totalRows,1);
+source_file  = strings(totalRows,1);
+col_idx      = zeros(totalRows,1);
+
+FEC   = zeros(totalRows,1);
+SOH   = zeros(totalRows,1);
+
+T_degC   = NaN(totalRows,1);
+mean_SOC = NaN(totalRows,1);    % (%)
+DOD_pct  = NaN(totalRows,1);    % (%)
+Cch_rate = NaN(totalRows,1);
+Cdch_rate= NaN(totalRows,1);
+
+parseLegend = @(s) local_parse_legend(s);
+cleanId = @(s) regexprep(regexprep(regexprep(regexprep(string(s),'\s+','_'),'°','deg'),'%','pct'),'[^A-Za-z0-9_\-\.]','');
+
+% pass 2: fill arrays
+p = 1;
+for f = 1:numel(files)
+    S = load(files{f});
+    if ~isfield(S,'X_Axis_Data_Mat') || ~isfield(S,'Y_Axis_Data_Mat'), continue; end
+    X = S.X_Axis_Data_Mat; Y = S.Y_Axis_Data_Mat;
+    [~,N] = size(X);
+
+    if isfield(S,'Legend_Vec') && numel(S.Legend_Vec)==N
+        L = S.Legend_Vec;
+    else
+        L = repmat({''},1,N);
+    end
+
+    for j = 1:N
+        m = ~isnan(X(:,j)) & ~isnan(Y(:,j));
+        if ~any(m), continue; end
+        idx = find(m); n = numel(idx);
+        rng_ = p:(p+n-1);
+
+        % series
+        FEC(rng_) = X(idx,j);
+        SOH(rng_) = Y(idx,j);
+
+        % meta
+        legend_label(rng_) = string(L{j});
+        source_file(rng_)  = string(files{f});
+        col_idx(rng_)      = j;
+
+        meta = parseLegend(L{j});
+        T_degC(rng_)    = meta.T_degC;
+        mean_SOC(rng_)  = meta.mean_SOC;
+        DOD_pct(rng_)   = meta.DOD_pct;
+        Cch_rate(rng_)  = meta.Cch_rate;
+        Cdch_rate(rng_) = meta.Cdch_rate;
+        profile_type(rng_) = meta.profile_type;
+
+        pid = cleanId(L{j});
+        if strlength(pid)==0
+            pid = cleanId(sprintf('%s_T%g_SOC%g_DOD%g_C+%g_C-%g', ...
+                   meta.profile_type, meta.T_degC, meta.mean_SOC, meta.DOD_pct, meta.Cch_rate, meta.Cdch_rate));
+        end
+        proto_id(rng_) = pid;
+
+        p = p + n;
+    end
+end
+
+% trim if needed
+if p<=totalRows
+    keep = 1:(p-1);
+    proto_id     = proto_id(keep);
+    legend_label = legend_label(keep);
+    profile_type = profile_type(keep);
+    source_file  = source_file(keep);
+    col_idx      = col_idx(keep);
+    FEC          = FEC(keep);
+    SOH          = SOH(keep);
+    T_degC       = T_degC(keep);
+    mean_SOC     = mean_SOC(keep);
+    DOD_pct      = DOD_pct(keep);
+    Cch_rate     = Cch_rate(keep);
+    Cdch_rate    = Cdch_rate(keep);
+end
+
+T_cyc = table(proto_id, source_file, legend_label, col_idx, ...
+              FEC, SOH, T_degC, mean_SOC, DOD_pct, Cch_rate, Cdch_rate, profile_type);
+T_cyc = sortrows(T_cyc, {'proto_id','FEC'});
+
+writetable(T_cyc, out_csv_long);
+save(out_mat_long, 'T_cyc');
+fprintf('\nWrote %s  (rows=%d, protocols=%d)\n', out_csv_long, height(T_cyc), numel(unique(T_cyc.proto_id)));
+
+%% ---------- STEP 2: FEATURE ENGINEERING & SCALING ----------
+% Features for v1 (numeric only). You can toggle USE_PROFILE_DUMMIES further below.
+baseFeat = {'FEC','T_degC','mean_SOC','DOD_pct','Cch_rate','Cdch_rate'};
+Xnum = T_cyc{:, baseFeat};
+
+% Optional one-hot for profile_type (Loadcollectives vs Cyclization etc.)
+if USE_PROFILE_DUMMIES
+    profCat = categorical(T_cyc.profile_type);
+    profD   = dummyvar(profCat);                    % one-hot
+    profNames = "prof_" + string(categories(profCat));
+    X = [Xnum, profD];
+    featNames = [baseFeat, cellstr(profNames)];
+else
+    X = Xnum;
+    featNames = baseFeat;
+end
+
+y = T_cyc.SOH;
+
+% scale using TRAIN-only stats later; define scaler now
+switch lower(SCALE_METHOD)
+    case 'standard'
+        scaler_fit = @(A) deal( mean(A,1,'omitnan'), std(A,0,1,'omitnan') );
+        scaler_apply = @(A,mu,sg) (A - mu) ./ max(sg, eps);
+        scaler_kind = 'standard';
+    case 'minmax'
+        scaler_fit = @(A) deal( min(A,[],1), max(A,[],1) );
+        scaler_apply = @(A,mn,mx) (A - mn) ./ max(mx - mn, eps);
+        scaler_kind = 'minmax';
+    case 'none'
+        scaler_fit = @(A) deal(zeros(1,size(A,2)), ones(1,size(A,2)));
+        scaler_apply = @(A,mu,sg) A;
+        scaler_kind = 'none';
+    otherwise
+        error('Unknown SCALE_METHOD.');
+end
+
+%% ---------- STEP 3: STRATIFIED SPLIT (by proto_id) ----------
+rng(RNG_SEED);
+uProto = unique(T_cyc.proto_id, 'stable');
+
+trainIdx = []; valIdx = []; testIdx = [];
+for k = 1:numel(uProto)
+    idx = find(T_cyc.proto_id==uProto{k});
+    idx = idx(randperm(numel(idx)));   % shuffle within protocol
+    n   = numel(idx);
+
+    if n >= 3
+        nTr = max(1, round(0.70*n));
+        nVa = max(1, round(0.15*n));
+        nTe = n - nTr - nVa;
+        if nTe < 1
+            nTe = 1; nVa = max(1, n - nTr - nTe);
+        end
+        takeTr = idx(1:nTr);
+        takeVa = idx(nTr+1:nTr+nVa);
+        takeTe = idx(nTr+nVa+1:end);
+    elseif n == 2
+        takeTr = idx(1); takeVa = []; takeTe = idx(2);
+    else
+        takeTr = idx(1); takeVa = []; takeTe = [];
+    end
+
+    trainIdx = [trainIdx; takeTr]; %#ok<AGROW>
+    valIdx   = [valIdx;   takeVa]; %#ok<AGROW>
+    testIdx  = [testIdx;  takeTe]; %#ok<AGROW>
+end
+
+TrainTbl = T_cyc(trainIdx, :);
+ValTbl   = T_cyc(valIdx,   :);
+TestTbl  = T_cyc(testIdx,  :);
+
+% Compute scalers on TRAIN ONLY
+Xtr = X(trainIdx, :);
+[mu_or_a, sg_or_b] = scaler_fit(Xtr);
+
+X_train = scaler_apply(Xtr, mu_or_a, sg_or_b);
+X_val   = scaler_apply(X(valIdx,:), mu_or_a, sg_or_b);
+X_test  = scaler_apply(X(testIdx,:), mu_or_a, sg_or_b);
+
+y_train = y(trainIdx);
+y_val   = y(valIdx);
+y_test  = y(testIdx);
+
+% Save split CSVs for sanity
+writetable(TrainTbl, train_csv);
+if ~isempty(ValTbl),  writetable(ValTbl,  val_csv);  end
+if ~isempty(TestTbl), writetable(TestTbl, test_csv); end
+
+fprintf('Split sizes: train=%d, val=%d, test=%d (total=%d)\n', numel(y_train), numel(y_val), numel(y_test), numel(y));
+
+%% ---------- STEP 4: FFNN DESIGN & TRAINING (Cycle Aging) ----------
+XTrain = single(X_train);   YTrain = single(y_train(:));
+XVal   = single(X_val);     YVal   = single(y_val(:));
+XTest  = single(X_test);    YTest  = single(y_test(:));
+
+inputDim = size(XTrain,2);
+
+layers = [
+    featureInputLayer(inputDim,'Name','in')
+    fullyConnectedLayer(64,'Name','fc1')
+    reluLayer('Name','r1')
+    dropoutLayer(0.1,'Name','d1')
+    fullyConnectedLayer(32,'Name','fc2')
+    reluLayer('Name','r2')
+    fullyConnectedLayer(1,'Name','out')
+    regressionLayer('Name','reg')
+];
+
+miniB = 64;
+opts = trainingOptions('adam', ...
+    'InitialLearnRate',1e-2, ...
+    'MaxEpochs',250, ...
+    'MiniBatchSize',miniB, ...
+    'Shuffle','every-epoch', ...
+    'ValidationData',{XVal, YVal}, ...
+    'ValidationFrequency',max(1, floor(size(XTrain,1)/miniB)), ...
+    'ValidationPatience',15, ...
+    'L2Regularization',1e-4, ...
+    'Verbose',false, ...
+    'Plots','training-progress', ...
+    'GradientThresholdMethod','l2norm','GradientThreshold',1, ...
+    'LearnRateSchedule','piecewise','LearnRateDropPeriod',20,'LearnRateDropFactor',0.5);
+
+rng(1);
+net = trainNetwork(XTrain, YTrain, layers, opts);
+
+% Evaluate
+pred = @(Xn) gather(predict(net, single(Xn)));
+y_pred_train = pred(X_train);
+y_pred_val   = pred(X_val);
+y_pred_test  = pred(X_test);
+
+mse  = @(a,b) mean((a-b).^2);
+rmse = @(a,b) sqrt(mse(a,b));
+mae  = @(a,b) mean(abs(a-b));
+r2   = @(a,b) 1 - sum((a-b).^2)/sum((b-mean(b)).^2);
+
+metrics = table( ...
+    [rmse(y_pred_train,y_train); rmse(y_pred_val,y_val); rmse(y_pred_test,y_test)], ...
+    [mae(y_pred_train,y_train);  mae(y_pred_val,y_val);  mae(y_pred_test,y_test)], ...
+    [r2(y_pred_train,y_train);   r2(y_pred_val,y_val);   r2(y_pred_test,y_test)], ...
+    'VariableNames', {'RMSE','MAE','R2'}, ...
+    'RowNames', {'Train','Val','Test'});
+disp(metrics);
+
+% Plot: Pred vs True (Test)
+figure('Name','Pred vs True — Cycle FFNN'); grid on; hold on;
+scatter(y_test, y_pred_test, 20, 'filled');
+xy = [min(y_test) max(y_test)]; plot(xy,xy,'k--','LineWidth',1);
+xlabel('True SOH'); ylabel('Predicted SOH'); title('FFNN — Test Set (Cycle)');
+axis tight;
+
+%% ---------- SAVE BUNDLE ----------
+scalers = struct('method',scaler_kind,'feature_names',{featNames}, ...
+                 'mu_or_a',mu_or_a,'sg_or_b',sg_or_b, ...
+                 'USE_PROFILE_DUMMIES',USE_PROFILE_DUMMIES);
+
+save(splits_mat, ...
+    'featNames','scalers','X_train','y_train','X_val','y_val','X_test','y_test', ...
+    'TrainTbl','ValTbl','TestTbl','net');
+
+fprintf('Saved artefacts: %s, %s, %s\n', out_mat_long, splits_mat, out_csv_long);
+
+%% ===================== local function =====================
+function meta = local_parse_legend(lbl)
+% Parse examples:
+%  'Testpoint Cyclization_40°C_50%SOC_100%DOD_1C_1C_CC+CV'
+%  'Testpoint LoadSpectrumPVBattery_40°C_51.4%SOC'
+% Any missing token -> NaN (numeric) or "" (string).
+
+    s = string(lbl);
+
+    % profile_type
+    prof = "";
+    m = regexp(s, 'Testpoint\s+([^_]+)', 'tokens', 'once');
+    if ~isempty(m), prof = string(m{1}); end
+
+    % Temperature (°C)
+    T = NaN;
+    m = regexp(s, '(-?\d+(?:\.\d+)?)\s*°C', 'tokens', 'once');
+    if ~isempty(m), T = str2double(m{1}); end
+
+    % Mean SOC (%)
+    mSOC = NaN;
+    m = regexp(s, '(\d+(?:\.\d+)?)\s*%SOC', 'tokens', 'once');
+    if ~isempty(m), mSOC = str2double(m{1}); end
+
+    % DOD (%)
+    DOD = NaN;
+    m = regexp(s, '(\d+(?:\.\d+)?)\s*%DOD', 'tokens', 'once');
+    if ~isempty(m), DOD = str2double(m{1}); end
+
+    % C-rates "xC_yC"
+    Cch = NaN; Cdch = NaN;
+    m = regexp(s, '(\d+(?:\.\d+)?)C_(\d+(?:\.\d+)?)C', 'tokens', 'once');
+    if ~isempty(m)
+        Cch  = str2double(m{1});
+        Cdch = str2double(m{2});
+    end
+
+    meta = struct('profile_type',prof, ...
+                  'T_degC',T, ...
+                  'mean_SOC',mSOC, ...
+                  'DOD_pct',DOD, ...
+                  'Cch_rate',Cch, ...
+                  'Cdch_rate',Cdch);
+end
