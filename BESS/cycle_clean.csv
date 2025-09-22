@@ -1,4 +1,4 @@
-proto_id,FEC,SOH,T_degC,mean_SOC,DOD_pct,Cch_rate,Cdch_rate
+cond_id,FEC,SOH,T_degC,mean_SOC,DOD_pct,Cch_rate,Cdch_rate
 Testpoint_Cyclization_25degC_50pctSOC_100pctDOD_1C_1C_CC,0,1,25,50,100,1,1
 Testpoint_Cyclization_25degC_50pctSOC_100pctDOD_1C_1C_CC,0,1,25,50,100,1,1
 Testpoint_Cyclization_25degC_50pctSOC_100pctDOD_1C_1C_CC,315.203154340036,0.976954229161928,25,50,100,1,1

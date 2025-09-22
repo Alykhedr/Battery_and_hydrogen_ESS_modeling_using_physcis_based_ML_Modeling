@@ -36,7 +36,7 @@ end
 assert(totalRows > 0, 'No finite (FEC, SOH) pairs found.');
 
 %% -------- Preallocate essentials --------
-proto_id  = strings(totalRows,1);
+cond_id  = strings(totalRows,1);
 FEC       = zeros(totalRows,1);
 SOH       = zeros(totalRows,1);
 T_degC    = NaN(totalRows,1);
@@ -83,13 +83,13 @@ for f = 1:numel(files)
         Cch_rate(rows)  = meta.Cch_rate;
         Cdch_rate(rows) = meta.Cdch_rate;
 
-        % proto id
+        % cond_id
         pid = cleanId(L{j});
         if strlength(pid) == 0
             pid = cleanId(sprintf('Proto_T%g_SOC%g_DOD%g_C+%g_C-%g', ...
                   meta.T_degC, meta.mean_SOC, meta.DOD_pct, meta.Cch_rate, meta.Cdch_rate));
         end
-        proto_id(rows) = pid;
+        cond_id(rows) = pid;
 
         p = p + n;
     end
@@ -98,7 +98,7 @@ end
 % trim if over-allocated
 if p <= totalRows
     keep = 1:(p-1);
-    proto_id  = proto_id(keep);
+    cond_id  = cond_id(keep);
     FEC       = FEC(keep);
     SOH       = SOH(keep);
     T_degC    = T_degC(keep);
@@ -109,8 +109,8 @@ if p <= totalRows
 end
 
 %% -------- Build table, sort, save --------
-T_cyc = table(proto_id, FEC, SOH, T_degC, mean_SOC, DOD_pct, Cch_rate, Cdch_rate);
-T_cyc = sortrows(T_cyc, {'proto_id','FEC'});
+T_cyc = table(cond_id, FEC, SOH, T_degC, mean_SOC, DOD_pct, Cch_rate, Cdch_rate);
+T_cyc = sortrows(T_cyc, {'cond_id','FEC'});
 
 writetable(T_cyc, outCSV);
 save(outMAT, 'T_cyc');

@@ -9,7 +9,7 @@ function plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, varargin)
 %   plot_hess(...,P_comp_kW,P_tank_bar,i_sol,V_cell,eta_F)
 %       -> +2 panels for electrolyzer current & voltage/efficiency
 
-  % parse optional inputs
+  % ---- parse optional inputs
   doComp = false;
   doElec = false;
   nOpt = numel(varargin);
@@ -17,13 +17,15 @@ function plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, varargin)
     [P_comp_kW, P_tank_bar] = deal(varargin{:});
     doComp = true;
   elseif nOpt == 5
-    [P_comp_kW, P_tank_bar, i_sol, V_cell, eta_F] = deal(varargin{:});
+    [P_comp_kW, P_tank_bar, i_model, V, eta_F] = deal(varargin{:});
     doComp = true;
     doElec = true;
+  elseif nOpt ~= 0
+    error('plot_hess: bad varargin: expected 0, 2, or 5 optional args.');
   end
 
-  % total rows
-  nrows = 3 + double(doComp) + double(doElec);
+  % ---- total rows (electrochem adds TWO panels)
+  nrows = 3 + double(doComp) + 2*double(doElec);
 
   figure('Units','normalized','Position',[.1 .1 .8 .8]);
 
@@ -38,7 +40,8 @@ function plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, varargin)
   subplot(nrows,1,2);
   plot(time, mass_H2, '-k','LineWidth',1.9);
   title('H2 Tank Level'); ylabel('Mass [kg]');
-  grid on; ylim([0 1.1*max(mass_H2)]);
+  grid on;
+  ymax = max(mass_H2); if ~isempty(ymax) && isfinite(ymax), ylim([0 1.1*ymax]); end
   xticks(0:10:time(end));
 
   % Panel 3: H2 Flow Rates
@@ -49,6 +52,7 @@ function plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, varargin)
   xticks(0:10:time(end));
 
   row = 4;
+
   % Panel 4: Compressor & Pressure
   if doComp
     subplot(nrows,1,row); row = row + 1;
@@ -59,15 +63,16 @@ function plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, varargin)
       plot(time, P_tank_bar, '--g','LineWidth',1.9);
       ylabel('Tank Pressure [bar]');
     title('Compressor & Tank Pressure');
-    xlabel('Time [hr]'); legend('P_{comp}','P_{tank}','Location','best');
-    grid on; xticks(0:10:time(end));
+    xlabel('Time [hr]');
+    legend('P_{comp}','P_{tank}','Location','best'); grid on;
+    xticks(0:10:time(end));
   end
 
   % Panels 5–6: Electrochemical variables
   if doElec
     % Panel 5: Current density
     subplot(nrows,1,row); row = row + 1;
-    plot(time, i_sol, '-b','LineWidth',1.9);
+    plot(time, i_model, '-b','LineWidth',1.9);
     title('Electrolyzer Current Density');
     ylabel('Current [A/cm^2]'); xlabel('Time [hr]'); grid on;
     xticks(0:10:time(end));
@@ -75,17 +80,18 @@ function plot_hess(time, P_el, P_fc, mass_H2, m_dot_el, m_dot_fc, varargin)
     % Panel 6: Cell voltage & Faraday efficiency
     subplot(nrows,1,row);
     yyaxis left
-      plot(time, V_cell, '-k','LineWidth',1.9);
+      plot(time, V, '-k','LineWidth',1.9);
       ylabel('Cell Voltage [V]');
     yyaxis right
       plot(time, eta_F, '--r','LineWidth',1.9);
       ylabel('Faraday Eff. [-]');
     title('Electrolyzer Voltage & Efficiency');
-    xlabel('Time [hr]'); legend('Voltage','eta_F','Location','best');
-    grid on; xticks(0:10:time(end));
+    xlabel('Time [hr]');
+    legend('Voltage','\eta_F','Location','best'); grid on;
+    xticks(0:10:time(end));
   end
 
-  % Always show full results table
+  % Always show full results table (quick sanity check)
   T = table( ...
     time(:), ...
     m_dot_el(:), ...

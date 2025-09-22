@@ -1,4 +1,3 @@
-
 clear; clc;
 
 %% ---------- SETTINGS ----------
@@ -39,7 +38,6 @@ SOC_pct_all   = zeros(N,1);
 SOC_store_all = zeros(N,1);
 t_h_all       = zeros(N,1);
 Q_Ah_all      = zeros(N,1);
-source_all    = strings(N,1);
 
 % -- fill by blocks --
 for k = 1:nC
@@ -71,13 +69,12 @@ for k = 1:nC
     SOC_store_all(rows) = SOC_store;
     t_h_all(rows)       = t_h;
     Q_Ah_all(rows)      = q;
-    source_all(rows)    = hdr;
 end
 
 out = table( ...
     cond_id_all, T_degC_all, T_K_all, SOC_store_all, SOC_pct_all, ...
-    t_h_all, Q_Ah_all, source_all, ...
-    'VariableNames', {'cond_id','T_degC','T_K','SOC_store','SOC_pct','t_h','Q_Ah','source_col'});
+    t_h_all, Q_Ah_all, ...
+    'VariableNames', {'cond_id','T_degC','T_K','SOC_store','SOC_pct','t_h','Q_Ah'});
 
 writetable(out, cleanCSV);
 disp("Wrote: " + cleanCSV + "  (#rows=" + height(out) + ")");
@@ -92,7 +89,6 @@ T2 = sortrows(out, {'cond_id','t_h'});
 Q0 = splitapply(@(q) q(find(~isnan(q),1,'first')), T2.Q_Ah, grp);
 mQ0 = containers.Map(ids, num2cell(Q0));
 T2.SOH_init = arrayfun(@(i) T2.Q_Ah(i) / mQ0(T2.cond_id{i}), (1:height(T2))');
-
 
 % -- EFC placeholder (calendar-only) --
 if ~ismember('EFC', string(T2.Properties.VariableNames))
@@ -120,9 +116,9 @@ for j = 1:numel(Xvars)
     T2.([Xvars{j} '_n']) = Xn(:, j);
 end
 
-% -- Final column order --
+% -- Final column order (no source_col) --
 T2 = T2(:, {'cond_id','T_degC','T_K','SOC_store','SOC_pct','t_h','Q_Ah', ...
-            'SOH_init','EFC','source_col', ...
+            'SOH_init','EFC', ...
             'T_degC_n','SOC_store_n','t_h_n'});
 
 writetable(T2, normCSV);
@@ -161,7 +157,7 @@ for k = 1:numel(u)
         nVa = max(1, round(0.15*n));
         nTe = n - nTr - nVa;
         if nTe < 1
-            nTe = 1; 
+            nTe = 1;
             nVa = max(1, n - nTr - nTe);
         end
         takeTr = idx(1:nTr);
@@ -169,11 +165,11 @@ for k = 1:numel(u)
         takeTe = idx(nTr+nVa+1:end);
     elseif n == 2
         takeTr = idx(1);
-        takeVa = []; 
+        takeVa = [];
         takeTe = idx(2);
     else % n == 1
         takeTr = idx(1);
-        takeVa = []; 
+        takeVa = [];
         takeTe = [];
     end
 
@@ -200,9 +196,6 @@ TestTbl  = T2(idxTest,  :);
 % Sanity check (counts)
 assert(height(TrainTbl) + height(ValTbl) + height(TestTbl) == height(T2), 'Split counts mismatch.');
 
-% Ensure each condition appears in train (by construction it should)
-% (Val/Test coverage depends on per-condition sample count.)
-
 % ----- Compute scalers on TRAIN ONLY -----
 Xtr = TrainTbl{:, featNames};
 
@@ -212,18 +205,15 @@ switch lower(SCALE_METHOD)
         sg = std(Xtr, 0, 1, 'omitnan'); sg(sg==0) = 1;
         scaleFun  = @(X) (X - mu) ./ sg;
         scalers = struct('method','standard','feature_names',{featNames},'mu',mu,'sigma',sg);
-
     case 'minmax'
         mn = min(Xtr, [], 1);
         mx = max(Xtr, [], 1);
         span = mx - mn; span(span==0) = 1;
         scaleFun  = @(X) (X - mn) ./ span;
         scalers = struct('method','minmax','feature_names',{featNames},'min',mn,'max',mx);
-
     case 'none'
         scaleFun  = @(X) X;
         scalers = struct('method','none','feature_names',{featNames});
-
     otherwise
         error('SCALE_METHOD must be ''standard'', ''minmax'', or ''none''.');
 end
@@ -244,25 +234,6 @@ for j = 1:numel(featNames)
     TestTbl.([featNames{j} '_trn'])  = X_test(:, j);
 end
 
-% ----- Quick verification of splits -----
-fprintf('Split sizes: train=%d, val=%d, test=%d (total=%d)\n', ...
-    numel(y_train), numel(y_val), numel(y_test), height(T2));
-
-% Distribution check (means & stds) — TRAIN vs VAL/TEST (feature-wise)
-if ~strcmpi(SCALE_METHOD,'none')
-    mTrain = mean(X_train,1); sTrain = std(X_train,0,1);
-    mVal   = mean(X_val,1);   sVal   = std(X_val,0,1);
-    mTest  = mean(X_test,1);  sTest  = std(X_test,0,1);
-    disp(table(featNames', mTrain', sTrain', mVal', sVal', mTest', sTest', ...
-        'VariableNames', {'Feature','TrainMean','TrainStd','ValMean','ValStd','TestMean','TestStd'}));
-end
-
-% Optional: ensure some conditions appear across splits (info only)
-% (Small n per condition may prevent full coverage.)
-% disp(groupsummary(TrainTbl,'cond_id'));
-% disp(groupsummary(ValTbl,'cond_id'));
-% disp(groupsummary(TestTbl,'cond_id'));
-
 % ----- Save artifacts -----
 save('calendar_splits.mat', ...
      'featNames','targetCol','scalers', ...
@@ -273,15 +244,11 @@ writetable(TrainTbl, 'calendar_train.csv');
 if ~isempty(ValTbl),  writetable(ValTbl,  'calendar_val.csv');  end
 if ~isempty(TestTbl), writetable(TestTbl, 'calendar_test.csv'); end
 
-disp('Saved: calendar_splits.mat + CSVs (train/val/test). Ready for Step 4 (FFNN).');
-
 %% ---------- STEP 4: FFNN DESIGN & TRAINING (Calendar Aging) ----------
-% Use 2-D arrays: X_* are [N x 3], y_* are [N x 1]
 XTrain = single(X_train);   YTrain = single(y_train(:));
 XVal   = single(X_val);     YVal   = single(y_val(:));
 XTest  = single(X_test);    YTest  = single(y_test(:));
 
-% 4A) Network (3 -> 32 -> 16 -> 1)
 layers = [
     featureInputLayer(3,'Name','in')
     fullyConnectedLayer(32,'Name','fc1')
@@ -293,7 +260,6 @@ layers = [
     regressionLayer('Name','reg')
 ];
 
-% 4B) Training options (val data as 2-D arrays)
 miniB = 32;
 opts = trainingOptions('adam', ...
     'InitialLearnRate',1e-2, ...
@@ -305,18 +271,18 @@ opts = trainingOptions('adam', ...
     'ValidationPatience',10, ...
     'L2Regularization',1e-4, ...
     'Verbose',false, ...
-    'Plots','training-progress','GradientThresholdMethod','l2norm','GradientThreshold',1, ...
-'LearnRateSchedule','piecewise','LearnRateDropPeriod',10,'LearnRateDropFactor',0.5);
+    'Plots','training-progress', ...
+    'GradientThresholdMethod','l2norm','GradientThreshold',1, ...
+    'LearnRateSchedule','piecewise','LearnRateDropPeriod',10,'LearnRateDropFactor',0.5);
 
 rng(1);
 net = trainNetwork(XTrain, YTrain, layers, opts);
 
-% 4C) Evaluate
+% ---- Evaluate
 y_pred_train = predict(net, XTrain);  y_pred_train = gather(y_pred_train(:));
 y_pred_val   = predict(net, XVal);    y_pred_val   = gather(y_pred_val(:));
 y_pred_test  = predict(net, XTest);   y_pred_test  = gather(y_pred_test(:));
 
-% Metrics
 mse  = @(a,b) mean((a-b).^2);
 rmse = @(a,b) sqrt(mse(a,b));
 mae  = @(a,b) mean(abs(a-b));
@@ -335,9 +301,8 @@ R2   = [ r2(y_pred_train,y_train);
          r2(y_pred_test, y_test) ];
 
 metrics = table(RMSE, MAE, R2, 'RowNames', {'Train','Val','Test'});
-disp(metrics)
+disp(metrics);
 
-% 4C) Plot 1: Pred vs True (Test)
 figure('Name','Pred vs True (Test)'); grid on; hold on;
 scatter(y_test, y_pred_test, 20, 'filled');
 plot([min(y_test) max(y_test)], [min(y_test) max(y_test)], 'k--', 'LineWidth',1);
